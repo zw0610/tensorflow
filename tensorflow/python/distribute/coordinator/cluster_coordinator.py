@@ -38,6 +38,7 @@ from tensorflow.python.eager import context
 from tensorflow.python.eager import def_function
 from tensorflow.python.eager import executor
 from tensorflow.python.eager import function as tf_function
+from tensorflow.python.eager import remote
 from tensorflow.python.framework import errors
 from tensorflow.python.framework import func_graph
 from tensorflow.python.framework import ops
@@ -132,6 +133,36 @@ def _maybe_as_type_spec(val):
     return val
 
 
+<<<<<<< HEAD
+=======
+@tf_export("distribute.experimental.coordinator.PerWorkerValues", v1=[])
+class PerWorkerValues(object):
+  """A container that holds a dict of values, one value per worker.
+
+  `tf.distribute.experimental.coordinator.PerWorkerValues` contains a collection
+  of values, where each of the values is located on its corresponding worker,
+  and upon being used as one of the `args` or `kwargs` of
+  `tf.distribute.experimental.coordinator.ClusterCoordinator.schedule()`, the
+  value specific to a worker will be passed into the function being executed at
+  that corresponding worker.
+
+  Currently, the only supported path to create an object of
+  `tf.distribute.experimental.coordinator.PerWorkerValues` is through calling
+  `iter` on a `ClusterCoordinator.create_per_worker_dataset`-returned
+  distributed dataset instance. The mechanism to create a custom
+  `tf.distribute.experimental.coordinator.PerWorkerValues` is not yet supported.
+  """
+
+  def __init__(self, values):
+    if isinstance(values, list):
+      self._values = {i: values[i] for i in range(len(values))}
+    elif isinstance(values, dict):
+      self._values = {key: value for key, value in values.items()}
+    else:
+      raise ValueError("values must be of type list or dict.")
+
+
+>>>>>>> 09418b96249 (Add add_worker and remove_worker to ClusterCoordinator for elastic training)
 def _select_worker_slice(worker_id, structured):
   """Selects the worker slice of each of the items in `structured`."""
 
@@ -629,9 +660,7 @@ class WorkerPreemptionHandler(object):
           # Consider adding backoff retry logic if we see the error logged
           # too frequently.
           logging.error("Cluster update failed with error: %s. Retrying...", e)
-          # Add sleep to prevent consistent cluster recovering in fault tolerance.
-          import time
-          time.sleep(5)
+
 
 class Worker(object):
   """A worker in a cluster.
@@ -668,7 +697,7 @@ class Worker(object):
     """Restart the stopped worker."""
     if self._should_worker_thread_run:
       return
-    # join the thread here the prevent deadlock in _closure_queue.get()
+    # Join the thread here the prevent deadlock in _closure_queue.get()
     if self._process_thread is not None:
       self._process_thread.join()
     self._should_worker_thread_run = True
@@ -967,6 +996,7 @@ class ClusterCoordinator(object):
     Raises:
       ValueError: if the strategy being used is not supported.
     """
+<<<<<<< HEAD
     if not getattr(self, "_has_initialized", False):
       if not isinstance(strategy,
                         parameter_server_strategy_v2.ParameterServerStrategyV2):
@@ -979,6 +1009,20 @@ class ClusterCoordinator(object):
       self.strategy.extended._used_with_coordinator = True
       self._cluster = Cluster(strategy)
       self._has_initialized = True
+=======
+    if not isinstance(strategy,
+                      parameter_server_strategy_v2.ParameterServerStrategyV2):
+      raise ValueError(
+          "Only `tf.distribute.experimental.ParameterServerStrategy` "
+          "is supported to work with "
+          "`tf.distribute.experimental.coordinator.ClusterCoordinator` "
+          "currently.")
+    self._strategy = strategy
+    self.strategy.extended._used_with_coordinator = True
+    self._cluster = Cluster(strategy)
+    self._cluster_spec = self._strategy._cluster_resolver.cluster_spec()
+    self._stopped_workers = {}
+>>>>>>> 09418b96249 (Add add_worker and remove_worker to ClusterCoordinator for elastic training)
 
   def __del__(self):
     self._cluster.stop()
@@ -1176,10 +1220,15 @@ class ClusterCoordinator(object):
       wraps a tuple of `tf.distribute.experimental.coordinator.RemoteValue`
       objects.
     """
-    results = []
+    results = {}
     for w in self._cluster.workers:
+<<<<<<< HEAD
       results.append(w.create_resource(fn, args=args, kwargs=kwargs))  # pylint: disable=protected-access
     return PerWorkerValues(tuple(results))
+=======
+      results[w.worker_index] = w._create_resource(fn, args=args, kwargs=kwargs)  # pylint: disable=protected-access
+    return PerWorkerValues(results)
+>>>>>>> 09418b96249 (Add add_worker and remove_worker to ClusterCoordinator for elastic training)
 
   def fetch(self, val):
     """Blocking call to fetch results from the remote values.
@@ -1239,7 +1288,160 @@ class ClusterCoordinator(object):
     # TODO(yuefengz): we should fetch values in a batch.
     return nest.map_structure(_maybe_fetch, val)
 
+  def remove_worker(self, address):
+    """Remove a worker to the cluster.
 
+    Args:
+      address: The address of the worker to remove.
+    """
+    task_indices = self._cluster_spec.task_indices("worker")
+    sorted(task_indices)
+    for i in range(len(task_indices)):
+      task_index = task_indices[i]
+      job_address = self._cluster_spec.task_address("worker", task_index)
+      if job_address == address:
+        self._cluster.workers[i].stop()
+        self._stopped_workers[address] = task_index
+        return
+    logging.warning(
+        "Worker address %r not exists in current cluster." % address)
+
+  def add_worker(self, address):
+    """Add a worker to the cluster.
+
+    Args:
+      address: The address of the worker to add.
+    """
+    if address in self._stopped_workers:
+      # If the address is a stopped worker, restart it.
+      remote.connect_to_cluster(
+          self._cluster_spec,
+          job_name="chief")
+      index = self._stopped_workers[address]
+      del self._stopped_workers[address]
+      self._cluster.workers[index].restart()
+      return
+
+    # Check if the address already exists in current cluster.
+    for job_name in parameter_server_strategy_v2.ALLOWED_TASK_TYPES:
+      for task_address in self._cluster_spec.job_tasks(job_name):
+        if task_address == address:
+          if job_name == "worker":
+            logging.warning(
+                "Worker address %r already active in current cluster." % address)
+            return
+          else:
+            raise ValueError(
+                "New worker address %r should not be the same as %r." %
+                (address, job_name))
+
+    # Start create the new cluster spec.
+    if self._stopped_workers:
+      # Removed the stopped workers from the cluster.
+      for i in range(len(self._cluster.workers)):
+        for _, stopped_index in self._stopped_workers.items():
+          if self._cluster.workers[i].worker_index == stopped_index:
+            self._cluster_spec.remove_task("worker", stopped_index)
+            self._cluster.workers[i] = None
+      self._stopped_workers = {}
+      self._cluster.workers = [w for w in self._cluster.workers
+                               if w is not None]
+    # Decide the task index for the new worker
+    index = 0
+    if self._cluster.workers:
+      index = self._cluster.workers[-1].worker_index + 1
+    self._cluster_spec.add_task("worker", index, address)
+    remote.connect_to_cluster(
+        self._cluster_spec,
+        job_name="chief")
+    # Update the ServerDef in the failure handler
+    self._cluster.failure_handler._server_def = context.get_server_def()
+    self._cluster.workers.append(
+        Worker(index, "/job:worker/replica:0/task:%d" % index, self._cluster)
+    )
+
+
+<<<<<<< HEAD
+=======
+class _PerWorkerDistributedDataset(object):
+  """Represents worker-distributed datasets created from dataset function."""
+
+  def __init__(self, dataset_fn, input_workers, coordinator):
+    """Makes an iterable from datasets created by the given function.
+
+    Args:
+      dataset_fn: A function that returns a `Dataset`.
+      input_workers: an `InputWorkers` object.
+      coordinator: a `ClusterCoordinator` object, used to create dataset
+        resources.
+    """
+    def disallow_variable_creation(next_creator, **kwargs):
+      raise ValueError("Creating variables in `dataset_fn` is not allowed.")
+
+    if isinstance(dataset_fn, def_function.Function):
+      with variable_scope.variable_creator_scope(disallow_variable_creation):
+        dataset_fn = dataset_fn.get_concrete_function()
+    elif not isinstance(dataset_fn, tf_function.ConcreteFunction):
+      with variable_scope.variable_creator_scope(disallow_variable_creation):
+        dataset_fn = def_function.function(dataset_fn).get_concrete_function()
+    self._dataset_fn = dataset_fn
+    self._input_workers = input_workers
+    self._coordinator = coordinator
+    self._element_spec = None
+
+  def __iter__(self):
+    # We would like users to create iterators outside `tf.function`s so that we
+    # can track them.
+    if (not context.executing_eagerly() or
+        ops.get_default_graph().building_function):
+      raise RuntimeError(
+          "__iter__() is not supported inside of tf.function or in graph mode.")
+
+    def _create_per_worker_iterator():
+      dataset = self._dataset_fn()
+      return iter(dataset)
+
+    # If _PerWorkerDistributedDataset.__iter__ is called multiple
+    # times, for the same object it should only create and register resource
+    # once. Using object id to distinguish different iterator resources.
+    per_worker_iterator = self._coordinator._create_per_worker_resources(
+        _create_per_worker_iterator)
+
+    # Setting type_spec of each RemoteValue so that functions taking these
+    # RemoteValues as inputs can be traced.
+    for iterator_remote_value in per_worker_iterator._values.values():
+      iterator_remote_value._type_spec = (
+          input_lib.get_iterator_spec_from_dataset(
+              self._coordinator.strategy, self._dataset_fn.structured_outputs))
+
+    return _PerWorkerDistributedIterator(per_worker_iterator._values)
+
+  @property
+  def element_spec(self):
+    """The type specification of an element of this dataset.
+
+    This property is subject to change without notice.
+    """
+    if not isinstance(self._dataset_fn, tf_function.ConcreteFunction):
+      raise NotImplementedError(
+          "`element_spec` is not supported when the `dataset_fn` is not "
+          "a `ConcreteFunction`.")
+    return self._dataset_fn.structured_outputs.element_spec
+
+
+class _PerWorkerDistributedIterator(PerWorkerValues):
+  """Distributed iterator for `ClusterCoordinator`."""
+
+  def __next__(self):
+    return self.get_next()
+
+  def get_next(self, name=None):
+    """Returns the next input from the iterator for all replicas."""
+    raise NotImplementedError("Iterating over an `AsyncDistributedIterator` "
+                              "is not supported right now.")
+
+
+>>>>>>> 09418b96249 (Add add_worker and remove_worker to ClusterCoordinator for elastic training)
 def _extract_failed_ps_instances(err_msg):
   """Return a set of potentially failing ps instances from error message."""
   tasks = re.findall("/job:ps/replica:0/task:[0-9]+", err_msg)
